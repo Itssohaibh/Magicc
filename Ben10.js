@@ -77,7 +77,8 @@
         const analysis = {
             risk_score: 0, issues: [], evidence: [],
             packet_id: this.stats.packets, player_id: playerId,
-            timestamp: packet.timestamp
+            timestamp: packet.timestamp,
+            packet: packet // Keep original packet
         };
         
         // 🔥 ALL 15 CHEAT PATTERNS
@@ -97,7 +98,7 @@
         
         this.updatePlayerStats(playerId, analysis);
         packet.analysis = analysis;
-        return packet;
+        return analysis;
     };
     
     // 🎯 PATTERN 1-4: AIMBOT DETECTION
@@ -107,7 +108,7 @@
         
         // 1. HEADLOCK (95%+ headshots)
         const player = this.playerData.get(analysis.player_id);
-        if (player && player.headshots / player.total_shots > 0.95) {
+        if (player && player.total_shots > 10 && player.headshots / player.total_shots > 0.95) {
             analysis.issues.push({score: 60, type: '🚨 HEADLOCK_AIMBOT'});
         }
         
@@ -147,6 +148,11 @@
             if (velocity > 25) {
                 analysis.issues.push({score: 55, type: '💨 SPEED_HACK'});
             }
+        }
+        
+        // 7. NO MOVEMENT ANIMATION
+        if (pos.x !== undefined && packet.body.animation === 'idle') {
+            analysis.issues.push({score: 35, type: '👻 NO_ANIMATION'});
         }
     };
     
@@ -214,7 +220,7 @@
     //  🛠️ UTILITIES
     // ==============================================
     GamePacketAnalyzer.prototype.getPlayerId = function(packet) {
-        return packet.body.player_id || packet.body.user_id || 'unknown';
+        return packet.body.player_id || packet.body.user_id || packet.body.uid || 'unknown';
     };
     
     GamePacketAnalyzer.prototype.calcDistance = function(p1, p2) {
@@ -228,7 +234,8 @@
     GamePacketAnalyzer.prototype.updatePlayerStats = function(playerId, analysis) {
         const player = this.playerData.get(playerId) || {
             packets: 0, risk: 0, headshots: 0, total_shots: 0,
-            last_pos: null, last_shot: 0, last_pos_time: 0
+            last_pos: null, last_shot: 0, last_pos_time: 0,
+            positions: []
         };
         
         player.packets++;
@@ -236,14 +243,16 @@
         player.avg_risk = player.risk / player.packets;
         
         // Update position tracking
-        if (analysis.packet.body.position) {
-            player.last_pos = analysis.packet.body.position;
-            player.last_pos_time = analysis.packet.timestamp;
+        const pos = analysis.packet.body.position;
+        if (pos && pos.x !== undefined) {
+            player.last_pos = { x: pos.x, y: pos.y, z: pos.z, time: analysis.timestamp };
+            player.positions.push(player.last_pos);
+            if (player.positions.length > 100) player.positions.shift();
         }
         
         // Shot tracking
         if (analysis.packet.body.shoot) {
-            player.last_shot = analysis.packet.body.shoot.timestamp;
+            player.last_shot = analysis.packet.body.shoot.timestamp || analysis.timestamp;
             player.total_shots++;
             if (analysis.packet.body.hit?.headshot) player.headshots++;
         }
@@ -255,6 +264,15 @@
     //  📊 OUTPUT FUNCTIONS
     // ==============================================
     function injectAnalysisMetadata(request, analysis) {
+        if (!request.body) request.body = {};
+        if (typeof request.body === 'string') {
+            try {
+                request.body = JSON.parse(request.body);
+            } catch(e) {
+                request.body = {};
+            }
+        }
+        
         if (!request.body.analysis) request.body.analysis = {};
         request.body.analysis.ben10 = {
             version: '4.0', packet_id: analysis.packet_id,
@@ -265,36 +283,72 @@
     }
     
     function logSuspiciousActivity(analysis) {
-        console.log(`🚨 [BEN10] #${analysis.packet_id} | ${analysis.overall_risk} | ${analysis.player_id} | ${analysis.issues.map(i=>i.type).join(' ')}`);
+        console.log(`🚨 [BEN10] #${analysis.packet_id} | ${analysis.overall_risk} | Player: ${analysis.player_id} | Patterns: ${analysis.issues.map(i=>i.type).join(', ')}`);
     }
     
     function showLiveStats() {
+        if (!analyzer) return;
+        
         const uptime = Math.floor((Date.now() - sessionStart)/1000);
-        const rate = ((suspiciousCount/packetCount)*100).toFixed(1);
+        const rate = packetCount > 0 ? ((suspiciousCount/packetCount)*100).toFixed(1) : '0.0';
         
         const top3 = Array.from(analyzer.playerData.entries())
-            .sort(([,a],[,b])=>b.avg_risk-a.avg_risk).slice(0,3)
-            .map(([id,d])=>`${id.slice(-6)}:${d.avg_risk.toFixed(0)}%`).join(' | ');
+            .sort(([,a],[,b]) => (b.avg_risk || 0) - (a.avg_risk || 0))
+            .slice(0,3)
+            .map(([id,d]) => `${id.slice(-6)}:${(d.avg_risk || 0).toFixed(0)}%`)
+            .join(' | ');
         
         console.log(`
 ╔══════════════════════════════════════════════════════╗
-║                BEN10 v4.0 - LIVE STATS                ║
+║                BEN10 v4.0 - LIVE STATS              ║
 ╠══════════════════════════════════════════════════════╣
-║ Packets: ${packetCount.toLocaleString()}              ║
-║ Suspicious: ${suspiciousCount} (${rate}%)            ║
+║ Packets: ${packetCount.toLocaleString().padEnd(10)}           ║
+║ Suspicious: ${suspiciousCount.toString().padEnd(6)} (${rate}%)            ║
 ║ Uptime: ${uptime}s                                   ║
-║ TOP 3: ${top3 || 'Clean'}                            ║
-║ Anomalies: ${analyzer.anomalies.length}              ║
+║ TOP 3: ${top3 || 'Clean'.padEnd(30)}                 ║
+║ Anomalies: ${analyzer.anomalies.length.toString().padEnd(8)}              ║
 ╚══════════════════════════════════════════════════════╝
         `);
     }
     
     // ==============================================
-    //  🎬 SHADOWROCKET EXPORT
+    //  🎬 SHADOWROCKET EXPORT - FIXED VERSION
     // ==============================================
-    $done({ 
-        policy: $policy.name || $policy.id,
-        request: main($request)
-    });
+    if (typeof $request !== 'undefined') {
+        const result = main($request);
+        
+        // Handle $done safely
+        if (typeof $done !== 'undefined') {
+            // Check if $policy exists before using it
+            let doneObj = { request: result };
+            
+            if (typeof $policy !== 'undefined') {
+                doneObj.policy = $policy.name || $policy.id;
+            } else {
+                // Provide a default policy name if $policy doesn't exist
+                doneObj.policy = "BEN10_DETECTION_POLICY";
+            }
+            
+            $done(doneObj);
+        } else {
+            // Fallback if $done doesn't exist (for testing)
+            console.log("[BEN10] Script executed successfully");
+        }
+    } else {
+        console.log("[BEN10] Running in standalone mode");
+        
+        // Export for testing
+        if (typeof module !== 'undefined' && module.exports) {
+            module.exports = {
+                main,
+                GamePacketAnalyzer,
+                getStats: () => ({
+                    packetCount,
+                    suspiciousCount,
+                    analyzer
+                })
+            };
+        }
+    }
     
 })();
